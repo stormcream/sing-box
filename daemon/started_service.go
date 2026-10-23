@@ -734,7 +734,12 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
 			itOutbound, _ := boxService.outboundManager.Outbound(it)
 			return itOutbound
 		}))
-		go group.URLTestOutbounds(boxService.ctx, boxService.outboundManager, historyStorage, boxService.logFactory.Logger(), outbounds, "", 0, true)
+		go func() {
+			group.URLTestOutbounds(boxService.ctx, boxService.outboundManager, historyStorage, boxService.logFactory.Logger(), outbounds, "", 0, true)
+			if urlTestGroup, isURLTestGroup := outboundGroup.(adapter.URLTestGroup); isURLTestGroup {
+				urlTestGroup.PerformUpdateCheck()
+			}
+		}()
 	} else {
 		go func() {
 			t, err := urltest.URLTest(boxService.ctx, "", outbound)

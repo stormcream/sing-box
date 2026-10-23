@@ -116,6 +116,8 @@ func ProxyDisplayName(proxyType string) string {
 		return "Selector"
 	case TypeURLTest:
 		return "URLTest"
+	case TypeFallback:
+		return "Fallback"
 	default:
 		return "Unknown"
 	}
