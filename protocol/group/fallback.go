@@ -2,6 +2,7 @@ package group
 
 import (
 	"context"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -41,7 +42,6 @@ type Fallback struct {
 	outbound.Adapter
 	ctx                          context.Context
 	outbound                     adapter.OutboundManager
-	connection                   adapter.ConnectionManager
 	logger                       log.ContextLogger
 	tags                         []string
 	link                         string
@@ -57,7 +57,6 @@ func NewFallback(ctx context.Context, router adapter.Router, logger log.ContextL
 		Adapter:                      outbound.NewAdapter(C.TypeFallback, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.Outbounds),
 		ctx:                          ctx,
 		outbound:                     service.FromContext[adapter.OutboundManager](ctx),
-		connection:                   service.FromContext[adapter.ConnectionManager](ctx),
 		logger:                       logger,
 		tags:                         options.Outbounds,
 		link:                         options.URL,
@@ -94,17 +93,26 @@ func (s *Fallback) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	return nil
 }
 
-func (s *Fallback) Now() string {
-	if s.group.selectedOutboundTCP != nil {
-		return s.group.selectedOutboundTCP.Tag()
-	} else if s.group.selectedOutboundUDP != nil {
-		return s.group.selectedOutboundUDP.Tag()
-	}
-	return ""
-}
-
 func (s *Fallback) All() []string {
 	return s.tags
+}
+
+func (s *Fallback) Selected(network string) adapter.Outbound {
+	var outbound adapter.Outbound
+	if network == N.NetworkUDP {
+		outbound = s.group.selectedOutboundUDP
+	} else {
+		outbound = s.group.selectedOutboundTCP
+	}
+	if outbound == nil {
+		outbound, _ = s.group.Select(network)
+	}
+	return outbound
+}
+
+func (s *Fallback) AttachConnection(closer io.Closer) func() {
+	s.group.Touch()
+	return s.group.interruptGroup.Add(closer, true)
 }
 
 func (s *Fallback) References() []string {
@@ -175,7 +183,7 @@ func (s *Fallback) DialContext(ctx context.Context, network string, destination 
 	}
 	s.logger.ErrorContext(ctx, err)
 	if ctx.Err() == nil {
-		s.group.reportFailure(outbound)
+		s.group.reportFailure(outbound, network)
 	}
 	return nil, err
 }
@@ -195,19 +203,9 @@ func (s *Fallback) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	}
 	s.logger.ErrorContext(ctx, err)
 	if ctx.Err() == nil {
-		s.group.reportFailure(outbound)
+		s.group.reportFailure(outbound, N.NetworkUDP)
 	}
 	return nil, err
-}
-
-func (s *Fallback) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	ctx = interrupt.ContextWithIsExternalConnection(ctx)
-	s.connection.NewConnection(ctx, s, conn, metadata, onClose)
-}
-
-func (s *Fallback) NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	ctx = interrupt.ContextWithIsExternalConnection(ctx)
-	s.connection.NewPacketConnection(ctx, s, conn, metadata, onClose)
 }
 
 type FallbackGroup struct {
@@ -314,7 +312,7 @@ func (g *FallbackGroup) Select(network string) (adapter.Outbound, bool) {
 		if firstOutbound == nil {
 			firstOutbound = detour
 		}
-		if g.history.LoadURLTestHistory(RealTag(g.outbound, detour)) != nil {
+		if g.history.LoadURLTestHistory(RealTag(detour, network)) != nil {
 			return detour, true
 		}
 	}
@@ -343,11 +341,11 @@ func (g *FallbackGroup) clearFailed(tag string) {
 
 // reportFailure marks the given outbound as failed, so the group immediately
 // switches to the first available outbound in the configured order.
-func (g *FallbackGroup) reportFailure(detour adapter.Outbound) {
+func (g *FallbackGroup) reportFailure(detour adapter.Outbound, network string) {
 	g.failedAccess.Lock()
 	g.failed[detour.Tag()] = true
 	g.failedAccess.Unlock()
-	g.history.DeleteURLTestHistory(RealTag(g.outbound, detour))
+	g.history.DeleteURLTestHistory(RealTag(detour, network))
 	g.performUpdateCheck()
 }
 
@@ -391,16 +389,16 @@ func (g *FallbackGroup) urlTest(ctx context.Context, force bool) (map[string]uin
 	}
 	defer g.checking.Store(false)
 	result := URLTestOutbounds(ctx, g.outbound, g.history, g.logger, g.outbounds, g.link, g.interval, force)
-	for _, detour := range g.outbounds {
-		if g.history.LoadURLTestHistory(RealTag(g.outbound, detour)) != nil {
-			g.clearFailed(detour.Tag())
-		}
-	}
 	g.performUpdateCheck()
 	return result, nil
 }
 
 func (g *FallbackGroup) performUpdateCheck() {
+	for _, detour := range g.outbounds {
+		if g.history.LoadURLTestHistory(RealTag(detour, N.NetworkTCP)) != nil {
+			g.clearFailed(detour.Tag())
+		}
+	}
 	g.updateAccess.Lock()
 	defer g.updateAccess.Unlock()
 	var (
